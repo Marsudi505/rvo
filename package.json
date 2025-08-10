@@ -1,0 +1,26 @@
+{
+  "name": "whatsapp-viewonce-bot",
+  "version": "1.0.0",
+  "description": "Bot WhatsApp untuk menyimpan dan mengirim ulang media view once",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.5.0",
+    "@hapi/boom": "^10.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "view-once",
+    "baileys",
+    "nodejs"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}
