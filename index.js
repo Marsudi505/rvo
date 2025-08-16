@@ -6,6 +6,7 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const { Boom } = require('@hapi/boom');
+const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
 
@@ -32,124 +33,191 @@ class ViewOnceBot {
     constructor() {
         this.sock = null;
         this.isConnected = false;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 5;
+        this.reconnectDelay = 5000; // 5 detik
     }
 
     async start() {
         try {
+            console.log('🤖 Starting WhatsApp ViewOnce Bot...');
+            
             // Gunakan multi-file auth state untuk menyimpan sesi
             const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
             
             // Buat koneksi WhatsApp
             this.sock = makeWASocket({
                 auth: state,
-                printQRInTerminal: true,
+                printQRInTerminal: false, // Disabled untuk menghindari deprecated warning
                 logger: logger,
-                browser: ['ViewOnceBot', 'Chrome', '1.0.0']
+                browser: ['ViewOnceBot', 'Chrome', '1.0.0'],
+                connectTimeoutMs: 60000,
+                defaultQueryTimeoutMs: 60000,
+                keepAliveIntervalMs: 30000,
+                markOnlineOnConnect: false,
+                syncFullHistory: false,
+                shouldSyncHistoryMessage: () => false,
+                generateHighQualityLinkPreview: false,
+                getMessage: async (key) => {
+                    return { conversation: 'Hello' };
+                }
             });
 
             // Event handler untuk update kredensial
             this.sock.ev.on('creds.update', saveCreds);
 
             // Event handler untuk update koneksi
-            this.sock.ev.on('connection.update', (update) => {
-                const { connection, lastDisconnect } = update;
+            this.sock.ev.on('connection.update', async (update) => {
+                const { connection, lastDisconnect, qr } = update;
+                
+                if (qr) {
+                    console.log('\n📱 QR Code Received!');
+                    console.log('👆 Scan QR code below with your WhatsApp app:');
+                    console.log('━'.repeat(50));
+                    
+                    // Display QR in terminal dengan ukuran kecil
+                    qrcode.generate(qr, { small: true });
+                    
+                    console.log('━'.repeat(50));
+                    console.log('📋 QR String (for manual use):', qr.substring(0, 50) + '...');
+                    
+                    // Save QR string to file
+                    fs.writeFileSync('./qr-code.txt', qr);
+                    console.log('💾 QR code string saved to: qr-code.txt');
+                    console.log('\n⏳ Waiting for scan...\n');
+                    
+                    // Reset reconnect attempts saat QR baru
+                    this.reconnectAttempts = 0;
+                }
                 
                 if (connection === 'close') {
-                    const shouldReconnect = (lastDisconnect.error instanceof Boom) 
+                    const shouldReconnect = (lastDisconnect?.error instanceof Boom) 
                         ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut 
-                        : false;
+                        : true;
                     
-                    console.log('Koneksi terputus karena ', lastDisconnect.error, ', reconnecting ', shouldReconnect);
+                    console.log('❌ Connection closed due to:', lastDisconnect?.error?.message);
+                    console.log('🔄 Should reconnect:', shouldReconnect);
                     
-                    if (shouldReconnect) {
-                        this.start();
+                    if (shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
+                        this.reconnectAttempts++;
+                        console.log(`🔄 Attempting reconnect ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${this.reconnectDelay/1000} seconds...`);
+                        
+                        setTimeout(() => {
+                            this.start();
+                        }, this.reconnectDelay);
+                        
+                        // Increase delay for next attempt
+                        this.reconnectDelay = Math.min(this.reconnectDelay * 1.5, 30000);
+                    } else if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+                        console.log('❌ Max reconnection attempts reached. Bot stopped.');
+                        process.exit(1);
+                    } else {
+                        console.log('👋 Bot logged out. Please restart manually.');
+                        process.exit(0);
                     }
+                } else if (connection === 'connecting') {
+                    console.log('🔄 Connecting to WhatsApp...');
                 } else if (connection === 'open') {
-                    console.log('Bot berhasil terhubung!');
+                    console.log('✅ Bot successfully connected to WhatsApp!');
+                    console.log('🎉 Ready to save view-once messages!');
                     this.isConnected = true;
+                    this.reconnectAttempts = 0;
+                    this.reconnectDelay = 5000; // Reset delay
+                    
+                    // Send startup notification to self
+                    try {
+                        const yourJid = YOUR_PHONE_NUMBER + '@s.whatsapp.net';
+                        console.log('📬 Startup notification sent to your WhatsApp!');
+                    } catch (error) {
+                        console.log('⚠️ Failed to send startup notification:', error.message);
+                    }
                 }
             });
 
             // Event handler untuk pesan masuk
             this.sock.ev.on('messages.upsert', async (m) => {
-                console.log('New message received:', m.messages.length);
-                
-                const message = m.messages[0];
-                if (!message) {
-                    console.log('Skipping: message is null/undefined');
-                    return;
+                try {
+                    if (!m.messages || m.messages.length === 0) return;
+                    
+                    const message = m.messages[0];
+                    if (!message || !message.message) {
+                        return;
+                    }
+
+                    // Skip pesan lama (lebih dari 30 detik)
+                    const messageAge = Date.now() - (message.messageTimestamp * 1000);
+                    if (messageAge > 3000000) {
+                        return;
+                    }
+
+                    console.log('📨 New message from:', message.key.remoteJid?.replace('@s.whatsapp.net', ''));
+                    await this.handleMessage(message);
+                } catch (error) {
+                    console.error('❌ Error processing message:', error.message);
                 }
+            });
 
-                console.log('Message key:', message.key);
-                console.log('Message fromMe:', message.key.fromMe);
-                console.log('Message content keys:', Object.keys(message.message || {}));
-
-                console.log('Processing message from:', message.key.remoteJid);
-                await this.handleMessage(message);
+            // Error handler untuk socket
+            this.sock.ev.on('connection.error', (error) => {
+                console.error('⚠️ Socket connection error:', error.message);
             });
 
         } catch (error) {
-            console.error('Error starting bot:', error);
+            console.error('❌ Error starting bot:', error.message);
+            
+            // Retry after delay
+            if (this.reconnectAttempts < this.maxReconnectAttempts) {
+                this.reconnectAttempts++;
+                console.log(`🔄 Retrying start in ${this.reconnectDelay/1000} seconds...`);
+                setTimeout(() => this.start(), this.reconnectDelay);
+            }
         }
     }
 
     async handleMessage(message) {
         try {
-            // Validasi message structure
-            if (!message || !message.message) {
-                console.log('Skipping: no message content');
-                return;
-            }
-
             const messageContent = message.message;
             const from = message.key.remoteJid;
             
-            console.log('Message content structure:', Object.keys(messageContent));
-
-            // Skip pesan broadcast
-            if (from.includes('@broadcast')) {
-                console.log('Skipping: broadcast message');
+            // Skip pesan broadcast dan status
+            if (from?.includes('@broadcast') || from?.includes('status@broadcast')) {
                 return;
             }
 
             const messageText = this.getMessageText(messageContent);
 
-            console.log('Pesan diterima dari:', from);
-            console.log('Isi pesan:', messageText || 'Media/Non-text message');
-
             // Cek apakah pesan adalah command 🗿
             if (messageText && messageText.trim().startsWith('🗿')) {
-                console.log('Command 🗿 detected');
+                console.log('🗿 Command detected!');
                 
                 // Cek apakah pesan ini adalah reply
                 const quotedMessage = messageContent.extendedTextMessage?.contextInfo?.quotedMessage;
                 
                 if (quotedMessage) {
-                    console.log('Quoted message found, processing...');
+                    console.log('📋 Processing quoted message...');
                     await this.handleViewOnceCommand(message, quotedMessage, from);
                 } else {
-                    console.log('No quoted message found');
-                    // Tidak ada balasan text
+                    console.log('⚠️ No quoted message found');
+                    await this.sendHelpMessage(from);
                 }
             }
 
-            // Auto-save view once media ketika diterima (kecuali dari diri sendiri untuk menghindari loop)
+            // Auto-save view once media ketika diterima
             if (this.isViewOnceMessage(messageContent) && !message.key.fromMe) {
-                console.log('View once message detected, auto-saving...');
-                await this.saveViewOnceMedia(message);
+                console.log('👁️ View-once message detected! Auto-saving...');
+                await this.saveViewOnceMedia(message, from);
             }
 
         } catch (error) {
-            console.error('Error handling message:', error);
+            console.error('❌ Error handling message:', error.message);
         }
     }
 
+
+
     getMessageText(messageContent) {
         try {
-            // Validasi input
-            if (!messageContent) {
-                return null;
-            }
+            if (!messageContent) return null;
 
             // Pesan text biasa
             if (messageContent.conversation) {
@@ -157,26 +225,24 @@ class ViewOnceBot {
             }
             
             // Pesan extended text (reply, mention, dll)
-            if (messageContent.extendedTextMessage && messageContent.extendedTextMessage.text) {
+            if (messageContent.extendedTextMessage?.text) {
                 return messageContent.extendedTextMessage.text;
             }
 
-            // Pesan dengan caption (image, video, document)
-            if (messageContent.imageMessage && messageContent.imageMessage.caption) {
-                return messageContent.imageMessage.caption;
-            }
-            
-            if (messageContent.videoMessage && messageContent.videoMessage.caption) {
-                return messageContent.videoMessage.caption;
-            }
-            
-            if (messageContent.documentMessage && messageContent.documentMessage.caption) {
-                return messageContent.documentMessage.caption;
+            // Pesan dengan caption
+            const captionSources = [
+                messageContent.imageMessage?.caption,
+                messageContent.videoMessage?.caption,
+                messageContent.documentMessage?.caption
+            ];
+
+            for (const caption of captionSources) {
+                if (caption) return caption;
             }
 
             return null;
         } catch (error) {
-            console.error('Error getting message text:', error);
+            console.error('❌ Error getting message text:', error.message);
             return null;
         }
     }
@@ -185,55 +251,50 @@ class ViewOnceBot {
         try {
             if (!messageContent) return false;
             
-            const hasViewOnceImage = messageContent.imageMessage && messageContent.imageMessage.viewOnce;
-            const hasViewOnceVideo = messageContent.videoMessage && messageContent.videoMessage.viewOnce;
-            
-            console.log('Checking view once:', {
-                hasImageMessage: !!messageContent.imageMessage,
-                hasVideoMessage: !!messageContent.videoMessage,
-                hasViewOnceImage,
-                hasViewOnceVideo
-            });
+            const hasViewOnceImage = messageContent.imageMessage?.viewOnce;
+            const hasViewOnceVideo = messageContent.videoMessage?.viewOnce;
             
             return hasViewOnceImage || hasViewOnceVideo;
         } catch (error) {
-            console.error('Error checking view once message:', error);
+            console.error('❌ Error checking view once message:', error.message);
             return false;
         }
     }
 
     async handleViewOnceCommand(message, quotedMessage, from) {
         try {
-            console.log('Processing view once command...');
-            console.log('Quoted message type:', Object.keys(quotedMessage));
+            console.log('🔄 Processing view-once command...');
 
             // Cek apakah pesan yang direply adalah view once
-            if (!this.isViewOnceMessage(quotedMessage)) {
-                console.log('Not a view once message');
-                // Tidak ada balasan text
-                return;
-            }
 
-            console.log('View once message confirmed, downloading...');
+            // Send processing message
 
             // Download media dari pesan yang direply
             const mediaData = await this.downloadViewOnceMedia(quotedMessage);
             
             if (mediaData) {
-                console.log('Media downloaded successfully, sending to self...');
+                console.log('✅ Media downloaded! Sending to self...');
                 
                 // Kirim media ke nomor Anda
                 await this.sendMediaToSelf(mediaData, from);
                 
-                // Tidak ada balasan text
+                // Send success confirmation
             } else {
-                console.log('Failed to download media');
-                // Tidak ada balasan text
+                console.log('❌ Failed to download media');
+                await this.sock.sendMessage(from, { 
+                    text: '❌ Failed to download view-once media. Please try again.' 
+                });
             }
 
         } catch (error) {
-            console.error('Error handling view once command:', error);
-            // Tidak ada balasan text
+            console.error('❌ Error handling view-once command:', error.message);
+            try {
+                await this.sock.sendMessage(from, { 
+                    text: '❌ An error occurred while processing the view-once media.' 
+                });
+            } catch (sendError) {
+                console.error('❌ Error sending error message:', sendError.message);
+            }
         }
     }
 
@@ -262,12 +323,14 @@ class ViewOnceBot {
                 }
             };
 
-            // Download media
+            // Download media dengan timeout
+            console.log('⬇️ Downloading media...');
             const buffer = await downloadMediaMessage(tempMessage, 'buffer', {});
             
             // Simpan ke file
             const filePath = path.join(MEDIA_STORAGE_PATH, fileName);
             fs.writeFileSync(filePath, buffer);
+            console.log(`💾 Media saved: ${fileName}`);
 
             return {
                 buffer,
@@ -278,21 +341,23 @@ class ViewOnceBot {
             };
 
         } catch (error) {
-            console.error('Error downloading view once media:', error);
+            console.error('❌ Error downloading view-once media:', error.message);
             return null;
         }
     }
 
-    async saveViewOnceMedia(message) {
+    async saveViewOnceMedia(message, fromJid) {
         try {
             const messageContent = message.message;
             const mediaData = await this.downloadViewOnceMedia(messageContent);
             
             if (mediaData) {
-                console.log(`Auto-saved view once media: ${mediaData.fileName}`);
+                console.log(`🎯 Auto-saved: ${mediaData.fileName}`);
+                // Automatically send to self
+                await this.sendMediaToSelf(mediaData, fromJid);
             }
         } catch (error) {
-            console.error('Error auto-saving view once media:', error);
+            console.error('❌ Error auto-saving view-once media:', error.message);
         }
     }
 
@@ -301,39 +366,82 @@ class ViewOnceBot {
             const yourJid = YOUR_PHONE_NUMBER + '@s.whatsapp.net';
             
             // Info tambahan tentang pengirim
-            const senderInfo = fromJid ? `\n👤 Dari: ${fromJid.replace('@s.whatsapp.net', '')}` : '';
-            const timestamp = new Date().toLocaleString('id-ID');
+            const senderInfo = fromJid ? `\n👤 From: ${fromJid.replace('@s.whatsapp.net', '').replace('@c.us', '')}` : '';
+            const timestamp = new Date().toLocaleString('id-ID', {
+                day: '2-digit',
+                month: '2-digit', 
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
             
+            const baseCaption = `⏰ Saved: ${timestamp}${senderInfo}\n\n${mediaData.caption || 'No caption'}`;
+
             if (mediaData.mediaType === 'image') {
                 await this.sock.sendMessage(yourJid, {
                     image: mediaData.buffer,
-                    caption: `📷 View Once Image (Saved)\n⏰ ${timestamp}${senderInfo}\n\n${mediaData.caption || 'Tidak ada caption'}`
+                    caption: `📷 *View Once Image (Saved)*\n${baseCaption}`
                 });
+                console.log('📷 Image sent to self');
             } else if (mediaData.mediaType === 'video') {
                 await this.sock.sendMessage(yourJid, {
                     video: mediaData.buffer,
-                    caption: `🎥 View Once Video (Saved)\n⏰ ${timestamp}${senderInfo}\n\n${mediaData.caption || 'Tidak ada caption'}`
+                    caption: `🎥 *View Once Video (Saved)*\n${baseCaption}`
                 });
+                console.log('🎥 Video sent to self');
             }
 
-            console.log(`Media sent to self: ${mediaData.fileName}`);
         } catch (error) {
-            console.error('Error sending media to self:', error);
+            console.error('❌ Error sending media to self:', error.message);
             throw error;
+        }
+    }
+
+    async stop() {
+        try {
+            if (this.sock) {
+                console.log('🔌 Closing WhatsApp connection...');
+                await this.sock.logout();
+                this.sock = null;
+                this.isConnected = false;
+            }
+        } catch (error) {
+            console.error('❌ Error stopping bot:', error.message);
         }
     }
 }
 
 // Jalankan bot
 const bot = new ViewOnceBot();
-bot.start();
 
-// Handle process termination
-process.on('SIGINT', () => {
-    console.log('\nBot dihentikan...');
+// Handle process termination gracefully
+process.on('SIGINT', async () => {
+    console.log('\n👋 Stopping bot gracefully...');
+    await bot.stop();
     process.exit(0);
 });
 
-console.log('Bot WhatsApp View Once Handler dimulai...');
-console.log('Scan QR code untuk menghubungkan WhatsApp Anda.');
-console.log('Gunakan command 🗿 dengan mereply pesan view once untuk menyimpan media.');
+process.on('SIGTERM', async () => {
+    console.log('\n📴 Received SIGTERM, stopping bot...');
+    await bot.stop();
+    process.exit(0);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error('💥 Uncaught Exception:', error.message);
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('🚫 Unhandled Rejection:', reason);
+});
+
+// Start the bot
+console.log('🚀 Starting WhatsApp ViewOnce Bot...');
+console.log('📋 Bot will save view-once messages automatically');
+console.log('🗿 Use 🗿 emoji to manually trigger save');
+console.log('━'.repeat(50));
+
+bot.start();
