@@ -282,7 +282,7 @@ class ViewOnceBot {
             } else {
                 console.log('❌ Failed to download media');
                 await this.sock.sendMessage(from, { 
-                    text: '❌ Failed to download view-once media. Please try again.' 
+                    text: '' 
                 });
             }
 
@@ -290,7 +290,7 @@ class ViewOnceBot {
             console.error('❌ Error handling view-once command:', error.message);
             try {
                 await this.sock.sendMessage(from, { 
-                    text: '❌ An error occurred while processing the view-once media.' 
+                    text: '' 
                 });
             } catch (sendError) {
                 console.error('❌ Error sending error message:', sendError.message);
